@@ -552,3 +552,197 @@ class TTMatrix(TensorizedMatrix, name='TTM'):
 
         args = [t.to_matrix() if hasattr(t, 'to_matrix') else t for t in args]
         return func(*args, **kwargs)
+
+### Auxiliary functions for SuKro factorization
+
+def rearrange(D,n,m,n_matrices=()):
+# Input matrix D is of size (n_matrices x prod(n) x prod(m))
+# Output tensor R_D is of size (n_matrices x n[0]m[0] x n[1]m[1] x ... x n[-1]m[-1])
+    assert len(n)==len(m)
+    #Handle n_matrices
+    tosqueeze = ()
+    if n_matrices == ():
+        D = torch.unsqueeze(D,0)
+        tosqueeze = True
+        n_matrices = (1,)
+
+    # Main recursion
+    if len(n)==1: # Base case: vectorizes a given block.
+        return D.reshape(n_matrices + (-1,))
+    else:
+        # Block sizes
+        n_rows = np.prod(n[1:])
+        n_cols = np.prod(m[1:])
+
+        # Go over each block of the matrix. Then recursively go over all sub-blocks in the block.
+        for i1 in range(n[0]):
+            for j1 in range(m[0]):
+                # Reorders the block and concatenates the results
+                res = rearrange(D[:,i1*n_rows:(i1+1)*n_rows, j1*n_cols:(j1+1)*n_cols], n[1:], m[1:], n_matrices)
+                res = torch.unsqueeze(res,1)
+                R_D = tl.concatenate((R_D,res), axis=1) if (i1,j1) != (0,0) else res
+
+        return torch.squeeze(R_D,0) if tosqueeze else R_D
+
+def rearrange_inv(R_D,n,m,n_matrices=()):
+# Input tensor R_D is of size (n_matrices x n[0]m[0] x n[1]m[1] x ... x n[-1]m[-1])
+# Output matrix D is of size (n_matrices x prod(n) x prod(m))
+    assert len(n)==len(m)
+    #Handle n_matrices
+    tosqueeze = ()
+    if n_matrices == ():
+        R_D = torch.unsqueeze(R_D,0)
+        tosqueeze = True
+        n_matrices = (1,)
+
+    # Main recursion
+    if len(n)==1: # Base case: unvectorizes a given block.
+        return R_D.reshape(n_matrices+n+m)
+    else:
+        # Go over each block of the tensor. Then recursively go over all fibers in the slice.
+        for i1 in range(n[0]):
+            for j1 in range(m[0]):
+                # Reorders the block and concatenates the results
+                res = rearrange_inv(R_D[:,i1*m[0] + j1], n[1:], m[1:], n_matrices)
+                D_i = tl.concatenate((D_i, res), axis=2) if j1 != 0 else res
+            D = tl.concatenate((D,D_i), axis=1) if i1 != 0 else D_i
+        return torch.squeeze(D,0) if tosqueeze else D
+
+
+
+class SuKroMatrix(TensorizedMatrix, name='SuKro'):
+    """Tensorized Matrix in SuKro (sum of Kroneckers) Form.
+
+    Matrix is tensorized with a particular entries rearrangement. Then CP factorization is applied.
+    """
+    def __init__(self, weights, factors, tensorized_row_shape, tensorized_column_shape, rank=None, n_matrices=()):
+        super().__init__()
+        if rank is None:
+            _, self.rank = tl.cp_tensor._validate_cp_tensor((weights, factors))
+        else:
+            self.rank = rank
+        self.shape = (np.prod(tensorized_row_shape), np.prod(tensorized_column_shape))
+        self.tensorized_shape = tensorized_row_shape + tensorized_column_shape
+        self.tensorized_row_shape = tensorized_row_shape
+        self.tensorized_column_shape = tensorized_column_shape
+
+        self.n_matrices = _ensure_tuple(n_matrices)
+        self.order = len(factors)
+        self.weights = weights
+        self.factors = factors
+
+    @classmethod
+    def new(cls, tensorized_row_shape, tensorized_column_shape, rank, n_matrices=(), **kwargs):
+        n_matrices = _ensure_tuple(n_matrices)
+        # Shape of the rearrange tensor is (n[0]m[0]x...x n[-1]m[-1]) not (n[0]x...x n[-1] x m[0]x...x m[-1])
+        tensor_shape = n_matrices + tuple([n*m for n, m in zip(tensorized_row_shape, tensorized_column_shape)])
+        rank = tl.cp_tensor.validate_cp_rank(tensor_shape, rank)
+        if len(tensor_shape)==2: # rank cannot exceed matrix dimensions when using SVD
+            rank = min(rank, max(tensor_shape))
+
+        # Register the parameters
+        weights = nn.Parameter(torch.Tensor(rank))
+        # Avoid the issues with ParameterList
+        factors = [nn.Parameter(torch.Tensor(s, rank)) for s in tensor_shape]
+
+        return cls(weights, factors, tensorized_row_shape, tensorized_column_shape, rank=rank, n_matrices=n_matrices)
+
+    @classmethod
+    def from_tensor(cls, tensor, tensorized_row_shape, tensorized_column_shape, rank, n_matrices=(), init='random', **kwargs):
+        # tensor is supposed to be already rearranged
+        n_matrices = _ensure_tuple(n_matrices)
+        rank = tl.cp_tensor.validate_cp_rank(n_matrices + tensorized_row_shape + tensorized_column_shape, rank)
+
+        with torch.no_grad():
+            weights, factors = parafac(tensor, rank, **kwargs)
+        weights = nn.Parameter(weights)
+        factors = [nn.Parameter(f) for f in factors]
+
+        return cls(weights, factors, tensorized_row_shape, tensorized_column_shape, rank, n_matrices)
+
+    @classmethod
+    def from_matrix(cls, matrix, tensorized_row_shape, tensorized_column_shape, rank, **kwargs):
+        if matrix.ndim > 2:
+            n_matrices = _ensure_tuple(tl.shape(matrix)[:-2])
+        else:
+            n_matrices = ()
+
+        tensor = rearrange(matrix, tensorized_row_shape, tensorized_column_shape, n_matrices)
+        return cls.from_tensor(tensor, tensorized_row_shape, tensorized_column_shape, rank, n_matrices=n_matrices, **kwargs)
+
+    def init_from_tensor(self, tensor, **kwargs):
+        #tensor is supposed to be already rearranged
+        with torch.no_grad():
+            weights, factors = parafac(tensor, self.rank, **kwargs)
+        self.weights = nn.Parameter(weights)
+        self.factors = FactorList([nn.Parameter(f) for f in factors])
+        return self
+
+    def init_from_matrix(self, matrix, **kwargs):
+        tensor = rearrange(matrix, self.tensorized_row_shape, self.tensorized_column_shape, self.n_matrices)
+        return self.init_from_tensor(tensor, **kwargs)
+
+
+    @property
+    def decomposition(self):
+        return self.weights, self.factors
+
+    def to_tensor(self):
+        return tl.cp_to_tensor(self.decomposition)
+
+    def to_matrix(self):
+        # Create sukro_to_matrix in tensorly, similar to tt_matrix_to_matrix or cp_to_tensor ?
+        # There are two ways to implement this:
+        # 1) Inverse rearrangement on the resulting CP tensor (implemented below)
+        # 2) Matricizing columns of the cp factors and taking the Kronecker product
+        tensor = tl.cp_to_tensor(self.decomposition)
+        return rearrange_inv(tensor, self.tensorized_row_shape, self.tensorized_column_shape, self.n_matrices)
+
+
+    def normal_(self, mean=0, std=1):
+        super().normal_(mean, std)
+        std_factors = (std/math.sqrt(self.rank))**(1/self.order)
+
+        with torch.no_grad():
+            self.weights.fill_(1)
+            for factor in self.factors:
+                factor.data.normal_(0, std_factors)
+        return self
+
+    def __getitem__(self, indices):
+        if isinstance(indices, int):
+            # Select one dimension of one mode
+            mixing_factor, *factors = self.factors
+            weights = self.weights*mixing_factor[indices, :]
+            return self.__class__(weights, factors, self.tensorized_row_shape,
+                                    self.tensorized_column_shape, n_matrices=self.n_matrices[1:])
+
+        elif isinstance(indices, slice):
+            # Index part of a factor
+            mixing_factor, *factors = self.factors
+            factors = [mixing_factor[indices], *factors]
+            weights = self.weights
+            return self.__class__(weights, factors, self.tensorized_row_shape,
+                                    self.tensorized_column_shape, n_matrices=self.n_matrices[1:])
+
+        else:
+            # Index multiple dimensions
+            factors = self.factors
+            index_factors = []
+            weights = self.weights
+            for index in indices:
+                if index is Ellipsis:
+                    raise ValueError(f'Ellipsis is not yet supported, yet got indices={indices} which contains one.')
+
+                mixing_factor, *factors = factors
+                if isinstance(index, int):
+                    if factors or index_factors:
+                        weights = weights*mixing_factor[index, :]
+                    else:
+                        # No factors left
+                        return tl.sum(weights*mixing_factor[index, :])
+                else:
+                    index_factors.append(mixing_factor[index])
+
+            return self.__class__(weights, index_factors+factors, self.shape, self.tensorized_row_shape,
+                                  self.tensorized_column_shape, n_matrices=self.n_matrices[len(indices):])

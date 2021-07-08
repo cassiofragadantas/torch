@@ -7,7 +7,7 @@ import tensorly as tl
 tl.set_backend('pytorch')
 from tensorly import testing
 
-@pytest.mark.parametrize('factorization', ['CP', 'Tucker', 'TT', 'TTM'])
+@pytest.mark.parametrize('factorization', ['CP', 'Tucker', 'TT', 'TTM', 'SuKro'])
 def test_FactorizedLinear(factorization):
     random_state = 12345
     rng = tl.check_random_state(random_state)
@@ -31,7 +31,7 @@ def test_FactorizedLinear(factorization):
 
     # Decompose an existing layer
     fc = nn.Linear(in_features, out_features, bias=True)
-    tfc = FactorizedLinear.from_linear(fc, (3, 3), (4, 4), rank=34, bias=True)
+    tfc = FactorizedLinear.from_linear(fc, in_shape, out_shape, rank=34, factorization=factorization, bias=True)
     res_fc = fc(data)
     res_tfc = tfc(data)
     testing.assert_array_almost_equal(res_fc, res_tfc, decimal=2)
@@ -39,7 +39,7 @@ def test_FactorizedLinear(factorization):
     # Multi-layer factorization
     fc1 = nn.Linear(in_features, out_features, bias=True)
     fc2 = nn.Linear(in_features, out_features, bias=True)
-    tfc = FactorizedLinear.from_linear_list([fc1, fc2], in_shape, out_shape, rank=38, bias=True)
+    tfc = FactorizedLinear.from_linear_list([fc1, fc2], in_shape, out_shape, rank=38, bias=True) #factorization=factorization
     ## Test first parametrized conv
     res_fc = fc1(data)
     res_tfc = tfc[0](data)
